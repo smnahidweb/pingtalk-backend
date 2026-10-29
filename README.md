@@ -7,7 +7,7 @@ authentication.
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20.19+, 22.12+, or 24+
 - PostgreSQL
 - The configured `backend/.env` and frontend `pingtalk/.env.local`
 
@@ -32,6 +32,9 @@ should use `npm run db:deploy`.
 
 The environment file must set `NODE_ENV`, `PORT`, `FRONTEND_URL`,
 `CORS_ORIGIN`, `DATABASE_URL`, `BETTER_AUTH_SECRET`, and `BETTER_AUTH_URL`.
+`DIRECT_URL` is optional for local use and selects the direct PostgreSQL
+connection for Prisma CLI operations when present; `DATABASE_URL` remains the
+application runtime connection.
 `CORS_ORIGIN` must be the exact frontend origin (without a path or trailing
 slash), and the auth secret must contain at least 32 characters. Startup
 validation reports variable names only; it never prints configured values.
@@ -40,6 +43,30 @@ From `Pingtalk/pingtalk/`, set `NEXT_PUBLIC_API_URL` in `.env.local` to the
 backend origin, then run `npm install` and `npm run dev`. The default local
 development URL is `http://localhost:5000`. Start the frontend and backend in
 separate terminals.
+
+## Render deployment
+
+Use the backend repository with Root Directory `.` and a Node.js release
+supported by Prisma 7.10.1 (20.19+, 22.12+, or 24+). Render sets `PORT` for the
+web service, and the server listens on that port without restricting the
+network interface. Render sets `RENDER=true`; on Render, Express trusts exactly
+one proxy hop so `express-rate-limit` can use the forwarded client IP without
+enabling unrestricted proxy trust. The existing one-hop Railway configuration
+is also preserved.
+
+Set the Render build command to `npm run build`, the start command to
+`npm start`, and the health-check path to `/api/health`. Configure
+`NODE_ENV=production`, `FRONTEND_URL`, matching exact `CORS_ORIGIN`,
+`BETTER_AUTH_URL`, `BETTER_AUTH_SECRET`, and the frontend's `NEXT_PUBLIC_API_URL`.
+For Neon, use its pooled connection string as `DATABASE_URL` for the running
+application and its direct (non-pooled) connection string as `DIRECT_URL` for
+Prisma CLI migration operations. The Prisma config falls back to `DATABASE_URL`
+when `DIRECT_URL` is unset, which keeps existing local setup working; set
+`DIRECT_URL` before production schema deployments.
+
+The health endpoint verifies that the API process is responsive; it does not
+perform a database connectivity check. No database migration is run as part of
+the application build or start commands.
 
 ## API
 

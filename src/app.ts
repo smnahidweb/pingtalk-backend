@@ -39,6 +39,9 @@ function limiter(windowMs: number, limit: number) {
 export function createApp(options: AppOptions = {}): Express {
   const app = express();
   app.disable("x-powered-by");
+  if (process.env.RAILWAY_ENVIRONMENT || process.env.RENDER === "true") {
+    app.set("trust proxy", 1);
+  }
   app.use(
     pinoHttp({
       logger,

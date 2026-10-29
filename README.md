@@ -101,14 +101,17 @@ match email addresses but returns only user IDs, names, and avatar URLs.
 
 ## Cookies and production origins
 
-The local frontend and API use different ports on `localhost`, so requests use
-`credentials: "include"` and the API returns credentials-enabled CORS headers
-for the configured exact origin. In production, prefer serving the frontend
-and API on the same site, for example `app.example.com` and `api.example.com`,
-or proxy `/api/*` through the frontend origin. Keep HTTPS enabled. Browsers can
-block cookies when the API is on an unrelated site; use a same-site deployment
-or a same-origin reverse proxy rather than broadly relaxing CORS or cookie
-policy.
+The frontend auth and API clients send credentials. Locally, they call the
+backend at `http://localhost:5000`. In production, Next.js proxies browser
+requests under `/api/*` to `NEXT_PUBLIC_API_URL`, making the browser-facing
+requests same-origin and avoiding dependence on third-party cookies between
+the default Vercel and Render domains. The backend CORS configuration still
+allows only the exact configured frontend origin with credentials.
+
+Better Auth cookies remain `HttpOnly` and `SameSite=Lax`; they are `Secure` in
+production. Keep HTTPS enabled. The authentication UI confirms the server
+session before opening the chat, so a failed cookie/session request produces
+an error instead of briefly showing the chat.
 
 ## Database design
 

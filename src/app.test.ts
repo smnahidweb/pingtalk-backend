@@ -3,6 +3,7 @@ import { test } from "node:test";
 import request from "supertest";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
+import { getAuthCookieAttributes } from "./lib/auth.js";
 
 const app = createApp({ mountAuth: false });
 
@@ -14,6 +15,19 @@ test("health endpoint reports service status without database details", async ()
     { status: "ok", service: "pingtalk-api" },
   );
   assert.equal("databaseUrl" in response.body, false);
+});
+
+test("auth cookies are secure in production and lax in all environments", () => {
+  assert.deepEqual(getAuthCookieAttributes(true), {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: true,
+  });
+  assert.deepEqual(getAuthCookieAttributes(false), {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+  });
 });
 
 test("CORS accepts the configured frontend origin and credentials", async () => {

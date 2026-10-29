@@ -3,6 +3,14 @@ import { prismaAdapter } from "@better-auth/prisma-adapter";
 import { env } from "../config/env.js";
 import { prisma } from "./prisma.js";
 
+export function getAuthCookieAttributes(isProduction: boolean) {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: isProduction,
+  };
+}
+
 export const auth = betterAuth({
   appName: "PingTalk",
   baseURL: env.BETTER_AUTH_URL,
@@ -19,11 +27,7 @@ export const auth = betterAuth({
   },
   advanced: {
     useSecureCookies: env.NODE_ENV === "production",
-    defaultCookieAttributes: {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: env.NODE_ENV === "production",
-    },
+    defaultCookieAttributes: getAuthCookieAttributes(env.NODE_ENV === "production"),
   },
 });
 

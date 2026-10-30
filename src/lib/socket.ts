@@ -1,6 +1,7 @@
 import { fromNodeHeaders } from "better-auth/node";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
+import type { Transport } from "engine.io";
 import { Server } from "socket.io";
 import { env } from "../config/env.js";
 import { auth } from "./auth.js";
@@ -48,7 +49,8 @@ export function createSocketServer(httpServer: HttpServer) {
       origin: env.FRONTEND_ORIGIN,
       credentials: true,
     },
-    transports: ["websocket", "polling"],
+    transports: ["polling", "websocket"],
+    addTrailingSlash: false,
     connectionStateRecovery: {
       maxDisconnectionDuration: 120_000,
       skipMiddlewares: false,
@@ -58,7 +60,53 @@ export function createSocketServer(httpServer: HttpServer) {
   socketServer = io;
   const userSockets = new Map<string, Set<string>>();
 
+  io.engine.on("connection_error", (error) => {
+    const requestUrl = new URL(error.req.url ?? "/", "http://localhost");
+    logger.warn(
+      {
+        code: error.code,
+        message: error.message,
+        origin: error.req.headers.origin,
+        transport: requestUrl.searchParams.get("transport"),
+      },
+      "Engine.IO connection attempt failed",
+    );
+  });
+
+  io.engine.on("connection", (engineSocket) => {
+    logger.info(
+      {
+        transport: engineSocket.transport.name,
+        origin: engineSocket.request.headers.origin,
+      },
+      "Engine.IO transport connected",
+    );
+    engineSocket.on("upgrade", (transport: Transport) => {
+      logger.info(
+        { transport: transport.name },
+        "Engine.IO transport upgraded",
+      );
+    });
+    engineSocket.on("close", (reason: string) => {
+      logger.info(
+        {
+          reason,
+          transport: engineSocket.transport.name,
+        },
+        "Engine.IO transport closed",
+      );
+    });
+  });
+
   io.use(async (socket, next) => {
+    logger.info(
+      {
+        origin: socket.request.headers.origin,
+        transport: socket.conn.transport.name,
+        hasCookie: Boolean(socket.request.headers.cookie),
+      },
+      "Socket.IO authentication attempt",
+    );
     try {
       const headers = socket.request.headers as IncomingHttpHeaders;
       const session = await auth.api.getSession({
@@ -225,8 +273,32 @@ export function createSocketServer(httpServer: HttpServer) {
       callback?.({ ok: true });
     });
 
-    socket.on("disconnect", () => {
-      logger.info({ userId, socketId: socket.id }, "Authenticated socket disconnected");
+    socket.conn.on("close", (reason) => {
+      logger.info(
+        {
+          userId,
+          socketId: socket.id,
+          reason,
+          transport: socket.conn.transport.name,
+        },
+        "Authenticated socket transport closed",
+      );
+    });
+
+    socket.on("disconnect", (reason, description) => {
+      logger.info(
+        {
+          userId,
+          socketId: socket.id,
+          reason,
+          description:
+            description instanceof Error
+              ? description.message
+              : description?.description,
+          transport: socket.conn.transport.name,
+        },
+        "Authenticated socket disconnected",
+      );
       const activeSockets = userSockets.get(userId);
       activeSockets?.delete(socket.id);
       if (!activeSockets || activeSockets.size === 0) {

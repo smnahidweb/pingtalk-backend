@@ -1,6 +1,7 @@
 import { ConversationRole, ConversationType } from "../generated/prisma/client.js";
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
+import { emitMessageCreated, emitReadReceipt } from "../lib/socket.js";
 import { HttpError, asyncRoute } from "../lib/errors.js";
 import {
   canManageConversation,
@@ -676,17 +677,20 @@ apiRouter.post(
       });
       return created;
     });
-    response.status(201).json({
-      message: {
-        id: message.id,
-        content: message.content,
-        createdAt: message.createdAt,
-        editedAt: message.editedAt,
-        deletedAt: message.deletedAt,
-        sender: message.sender,
-        read: false,
-      },
-    });
+
+    const serializedMessage = {
+      id: message.id,
+      content: message.content,
+      createdAt: message.createdAt,
+      editedAt: message.editedAt,
+      deletedAt: message.deletedAt,
+      sender: message.sender,
+      read: false,
+    };
+
+    emitMessageCreated(conversationId, serializedMessage);
+
+    response.status(201).json({ message: serializedMessage });
   }),
 );
 
@@ -756,6 +760,7 @@ apiRouter.post(
         create: { messageId, userId },
         update: { readAt: new Date() },
       });
+      emitReadReceipt(message.conversationId, messageId, userId);
     }
     response.status(204).end();
   }),

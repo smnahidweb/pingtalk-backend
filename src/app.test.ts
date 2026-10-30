@@ -130,4 +130,20 @@ test("protected profile endpoint rejects unauthenticated requests", async () => 
   assert.deepEqual(response.body, {
     error: { code: "UNAUTHENTICATED", message: "Sign in to continue." },
   });
+
+  test("profile photo mutations and message reactions require authentication", async () => {
+    const [upload, remove, reaction] = await Promise.all([
+      request(app)
+        .post("/api/me/image")
+        .set("Content-Type", "image/png")
+        .send(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+      request(app).delete("/api/me/image"),
+      request(app)
+        .post("/api/messages/message-id/reactions")
+        .send({ emoji: "👍" }),
+    ]);
+    assert.equal(upload.status, 401);
+    assert.equal(remove.status, 401);
+    assert.equal(reaction.status, 401);
+  });
 });

@@ -32,6 +32,7 @@ model User {
   memberships        ConversationMember[]
   sentMessages       Message[]           @relation("MessageSender")
   readReceipts       MessageReadReceipt[]
+  reactions          MessageReaction[]
 
   @@index([name])
 }
@@ -128,6 +129,7 @@ model Message {
   conversation   Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender         User                @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   readReceipts   MessageReadReceipt[]
+  reactions      MessageReaction[]
 
   @@index([conversationId, createdAt, id])
   @@index([senderId, createdAt])
@@ -143,4 +145,19 @@ model MessageReadReceipt {
 
   @@unique([messageId, userId])
   @@index([userId, readAt])
+}
+
+model MessageReaction {
+  id        String   @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+  @@index([messageId, emoji])
+  @@index([userId])
 }

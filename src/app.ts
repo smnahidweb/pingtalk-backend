@@ -89,6 +89,7 @@ export function createApp(options: AppOptions = {}): Express {
   app.use("/api/auth", limiter(15 * 60 * 1000, 30));
   app.use("/api/users", limiter(60 * 1000, 60));
   app.use("/api/conversations", limiter(60 * 1000, 120));
+  app.use("/api/me/image", limiter(15 * 60 * 1000, 12));
   if (options.mountAuth !== false) {
     const handler = options.authHandler ?? toNodeHandler(auth);
     app.all("/api/auth", handler);

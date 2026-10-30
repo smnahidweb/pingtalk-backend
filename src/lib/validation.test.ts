@@ -5,6 +5,7 @@ import {
   listQuerySchema,
   listMessagesQuerySchema,
   messageBodySchema,
+  messageReactionBodySchema,
   profileBodySchema,
   userSearchQuerySchema,
 } from "./validation.js";
@@ -86,4 +87,12 @@ test("profile updates allow only valid, supported fields", () => {
   );
   assert.equal(profileBodySchema.safeParse({ email: "private@example.com" }).success, false);
   assert.equal(profileBodySchema.safeParse({ name: "x" }).success, false);
+});
+
+test("message reactions accept only the supported emoji set", () => {
+  for (const emoji of ["❤️", "😂", "👍", "😮", "😢", "😡"]) {
+    assert.deepEqual(messageReactionBodySchema.parse({ emoji }), { emoji });
+  }
+  assert.equal(messageReactionBodySchema.safeParse({ emoji: "🔥" }).success, false);
+  assert.equal(messageReactionBodySchema.safeParse({ emoji: "👍".repeat(5) }).success, false);
 });

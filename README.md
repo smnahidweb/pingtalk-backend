@@ -38,6 +38,11 @@ application runtime connection.
 `CORS_ORIGIN` must be the exact frontend origin (without a path or trailing
 slash), and the auth secret must contain at least 32 characters. Startup
 validation reports variable names only; it never prints configured values.
+Profile-photo uploads additionally require all three server-only values:
+`CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and
+`CLOUDINARY_API_SECRET`. Leave all three unset to disable uploads; the backend
+continues to start and users can still remove an existing photo. Never expose
+these Cloudinary values to the frontend.
 
 From `Pingtalk/pingtalk/`, set `NEXT_PUBLIC_API_URL` in `.env.local` to the
 backend origin, then run `npm install` and `npm run dev`. The default local
@@ -67,15 +72,27 @@ when `DIRECT_URL` is unset, which keeps existing local setup working; set
 The health endpoint verifies that the API process is responsive; it does not
 perform a database connectivity check. No database migration is run as part of
 the application build or start commands.
+Before releasing reaction support, apply the checked-in additive migration
+with `npm run db:deploy` against the existing production database. It creates
+the reaction table and constraints without resetting or rewriting existing
+records. Configure the three Cloudinary variables on Render before enabling
+profile-photo uploads; no frontend storage secret or URL change is required.
 
 ## API
 
 - `GET /api/health`: liveness status; does not expose database connection data.
 - Better Auth endpoints: `/api/auth/*` (email sign-up/sign-in, sign-out, and
   session retrieval).
-- Authenticated profile endpoints: `GET/PATCH /api/me` and
-  `GET /api/users/:userId`. Profile edits are limited to display name, image URL,
-  and status message; public profiles never include email or auth fields.
+- Authenticated profile endpoints: `GET/PATCH /api/me`,
+  `POST/DELETE /api/me/image`, and `GET /api/users/:userId`. Upload a raw JPEG,
+  PNG, or WebP body (maximum 5 MB) to `POST /api/me/image`; the backend validates
+  the file signature and stores it in Cloudinary using server-side credentials.
+  Photo removal clears the authenticated user's image and removes the app-owned
+  Cloudinary asset when storage is configured. The existing `PATCH /api/me`
+  profile contract continues to accept display name, image URL, and status
+  message; public profiles never include email or auth fields. Profile changes
+  are also broadcast to the user's authenticated conversation rooms as
+  `user:profile-updated`.
 - `GET /api/users?query=...&limit=20&cursor=...` searches by name/email, omits
   the current user, returns only public fields, and uses bounded cursor pages.
 - `GET /api/conversations?limit=20&cursor=...` returns the member's recent
@@ -94,6 +111,11 @@ the application build or start commands.
   `GET /api/conversations/:id/messages`, and edited/deleted through
   `PATCH/DELETE /api/messages/:id`. Read receipts are updated through
   `POST /api/messages/:id/read` or `POST /api/conversations/:id/read`.
+- Message reactions are changed through
+  `POST/DELETE /api/messages/:id/reactions`; accepted reactions are ❤️, 😂, 👍,
+  😮, 😢, and 😡. Each user has at most one reaction per message. Message
+  history includes reactions, and authorized changes are broadcast through the
+  existing Socket.IO conversation room as `message:reactions`.
 
 Protected endpoints require the Better Auth session cookie. Conversation
 membership is checked on every conversation/message operation. User search may
@@ -134,7 +156,9 @@ npm test
 ```
 
 The tests cover health output, exact-origin CORS, error responses,
-unauthenticated access, authorization policies, and input validation. The
+unauthenticated profile-photo and reaction access, Cloudinary asset-ID privacy,
+profile-image format/size validation, authorization policies, and reaction
+input validation. The
 configured PostgreSQL service was also used for cleaned-up Better Auth
 sign-up/session/sign-in/sign-out, profile/search privacy, pagination, private
 conversation reuse, group creation/management/ownership transfer, message
@@ -157,3 +181,9 @@ some restrictive networks may prevent media from connecting. In an eight-person
 call each device can send media to up to seven peers, which increases bandwidth
 and device load. These calls are intended for small groups, not large meetings.
 Both backend and frontend deployments must be updated to release call changes.
+
+Incoming foreground alerts use a generated Web Audio ringtone, device vibration
+where supported, and the browser Notification API after the user grants
+permission. There is no service worker or Web Push subscription infrastructure;
+alerts are not guaranteed when the browser is closed or suspends the app. No
+additional environment variables are required for these foreground alerts.

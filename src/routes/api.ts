@@ -1,8 +1,25 @@
 import { ConversationRole, ConversationType } from "../generated/prisma/client.js";
-import { Router } from "express";
+import express, { Router } from "express";
 import { prisma } from "../lib/prisma.js";
-import { emitMessageCreated, emitReadReceipt } from "../lib/socket.js";
+import {
+  emitMessageCreated,
+  emitMessageReactionsUpdated,
+  emitReadReceipt,
+  emitUserProfileUpdated,
+} from "../lib/socket.js";
 import { HttpError, asyncRoute } from "../lib/errors.js";
+import {
+  removeMessageReaction,
+  setMessageReaction,
+  type MessageReactionStore,
+} from "../lib/message-reactions.js";
+import {
+  deleteProfileImage,
+  isProfileImageStorageConfigured,
+  PROFILE_IMAGE_MAX_BYTES,
+  uploadProfileImage,
+  validateProfileImage,
+} from "../lib/profile-image.js";
 import {
   canManageConversation,
   canModifyMessage,
@@ -17,6 +34,7 @@ import {
   listMessagesQuerySchema,
   messageBodySchema,
   messageParamsSchema,
+  messageReactionBodySchema,
   participantParamsSchema,
   privateConversationBodySchema,
   profileBodySchema,
@@ -61,6 +79,35 @@ async function requireMessageAccess(messageId: string, userId: string) {
 
 export const apiRouter = Router();
 apiRouter.use(authenticate);
+
+const messageReactionStore: MessageReactionStore = {
+  findAccessibleMessage: async (messageId, userId) => {
+    try {
+      return await requireMessageAccess(messageId, userId);
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) return null;
+      throw error;
+    }
+  },
+  async set(messageId, userId, emoji) {
+    await prisma.messageReaction.upsert({
+      where: { messageId_userId: { messageId, userId } },
+      create: { messageId, userId, emoji },
+      update: { emoji },
+    });
+  },
+  async remove(messageId, userId) {
+    await prisma.messageReaction.deleteMany({
+      where: { messageId, userId },
+    });
+  },
+  list(messageId) {
+    return prisma.messageReaction.findMany({
+      where: { messageId },
+      select: { userId: true, emoji: true },
+    });
+  },
+};
 
 apiRouter.get(
   "/me",
@@ -116,6 +163,61 @@ apiRouter.patch(
         select: { id: true, name: true, email: true, image: true },
       });
       return { ...updatedUser, profile };
+    });
+    await emitUserProfileUpdated(userId, {
+      id: user.id,
+      name: user.name,
+      image: user.image,
+    });
+    response.json({ user });
+  }),
+);
+
+apiRouter.post(
+  "/me/image",
+  express.raw({ type: () => true, limit: PROFILE_IMAGE_MAX_BYTES }),
+  asyncRoute(async (request, response) => {
+    const userId = requireUser(request);
+    const contentType = (
+      request.get("content-type")?.split(";")[0] ?? ""
+    )
+      .trim()
+      .toLowerCase();
+    if (!Buffer.isBuffer(request.body)) {
+      throw new HttpError(400, "INVALID_IMAGE", "The request must contain an image file.");
+    }
+    validateProfileImage(request.body, contentType);
+    const uploaded = await uploadProfileImage(userId, request.body, contentType);
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { image: uploaded.image },
+      select: { id: true, name: true, email: true, image: true },
+    });
+    await emitUserProfileUpdated(userId, {
+      id: user.id,
+      name: user.name,
+      image: user.image,
+    });
+    response.json({ user });
+  }),
+);
+
+apiRouter.delete(
+  "/me/image",
+  asyncRoute(async (request, response) => {
+    const userId = requireUser(request);
+    if (isProfileImageStorageConfigured()) {
+      await deleteProfileImage(userId);
+    }
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { image: null },
+      select: { id: true, name: true, email: true, image: true },
+    });
+    await emitUserProfileUpdated(userId, {
+      id: user.id,
+      name: user.name,
+      image: user.image,
     });
     response.json({ user });
   }),
@@ -634,6 +736,9 @@ apiRouter.get(
         readReceipts: {
           select: { userId: true },
         },
+        reactions: {
+          select: { userId: true, emoji: true },
+        },
       },
     });
     const hasMore = messages.length > limit;
@@ -646,6 +751,7 @@ apiRouter.get(
         editedAt: message.editedAt,
         deletedAt: message.deletedAt,
         sender: message.sender,
+        reactions: message.reactions,
         read:
           message.sender.id === userId
             ? message.readReceipts.some((receipt) => receipt.userId !== userId)
@@ -669,6 +775,7 @@ apiRouter.post(
         data: { conversationId, senderId: userId, content },
         include: {
           sender: { select: { id: true, name: true, image: true } },
+          reactions: { select: { userId: true, emoji: true } },
         },
       });
       await transaction.conversation.update({
@@ -685,12 +792,53 @@ apiRouter.post(
       editedAt: message.editedAt,
       deletedAt: message.deletedAt,
       sender: message.sender,
+      reactions: message.reactions,
       read: false,
     };
 
     emitMessageCreated(conversationId, serializedMessage);
 
     response.status(201).json({ message: serializedMessage });
+  }),
+);
+
+apiRouter.post(
+  "/messages/:messageId/reactions",
+  asyncRoute<RouteParams>(async (request, response) => {
+    const userId = requireUser(request);
+    const { messageId } = messageParamsSchema.parse(request.params);
+    const { emoji } = messageReactionBodySchema.parse(request.body);
+    const result = await setMessageReaction(
+      messageReactionStore,
+      messageId,
+      userId,
+      emoji,
+    );
+    emitMessageReactionsUpdated(
+      result.conversationId,
+      messageId,
+      result.reactions,
+    );
+    response.json({ reactions: result.reactions });
+  }),
+);
+
+apiRouter.delete(
+  "/messages/:messageId/reactions",
+  asyncRoute<RouteParams>(async (request, response) => {
+    const userId = requireUser(request);
+    const { messageId } = messageParamsSchema.parse(request.params);
+    const result = await removeMessageReaction(
+      messageReactionStore,
+      messageId,
+      userId,
+    );
+    emitMessageReactionsUpdated(
+      result.conversationId,
+      messageId,
+      result.reactions,
+    );
+    response.json({ reactions: result.reactions });
   }),
 );
 

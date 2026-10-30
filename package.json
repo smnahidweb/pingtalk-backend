@@ -8,7 +8,7 @@
     "build": "prisma generate && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "lint": "eslint .",
-    "test": "tsx --test src/app.test.ts src/lib/authorization.test.ts src/lib/validation.test.ts src/lib/call-registry.test.ts",
+    "test": "tsx --test src/app.test.ts src/lib/authorization.test.ts src/lib/validation.test.ts src/lib/profile-image.test.ts src/lib/message-reactions.test.ts src/lib/call-registry.test.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",

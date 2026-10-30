@@ -59,6 +59,10 @@ export const profileBodySchema = z.object({
     profile.statusMessage !== undefined,
 );
 
+export const messageReactionBodySchema = z.object({
+  emoji: z.enum(["❤️", "😂", "👍", "😮", "😢", "😡"]),
+});
+
 export const groupNameBodySchema = z.object({
   name: z.string().trim().min(1).max(100),
 });

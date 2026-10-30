@@ -26,7 +26,10 @@ type SerializedMessage = {
   deletedAt: string | Date | null;
   sender: { id: string; name: string; image: string | null };
   read: boolean;
+  reactions: Array<{ userId: string; emoji: string }>;
 };
+
+type SerializedReaction = { userId: string; emoji: string };
 
 type SocketAck = (result: {
   ok: boolean;
@@ -86,6 +89,36 @@ export function emitReadReceipt(
     messageId,
     userId,
   });
+}
+
+export function emitMessageReactionsUpdated(
+  conversationId: string,
+  messageId: string,
+  reactions: SerializedReaction[],
+) {
+  socketServer?.to(`conversation:${conversationId}`).emit("message:reactions", {
+    conversationId,
+    messageId,
+    reactions,
+  });
+}
+
+export async function emitUserProfileUpdated(
+  userId: string,
+  profile: { id: string; name: string; image: string | null },
+) {
+  if (!socketServer) return;
+  const memberships = await prisma.conversationMember.findMany({
+    where: { userId },
+    select: { conversationId: true },
+  });
+  const payload = { user: profile };
+  socketServer
+    .to([
+      `user:${userId}`,
+      ...memberships.map(({ conversationId }) => `conversation:${conversationId}`),
+    ])
+    .emit("user:profile-updated", payload);
 }
 
 export function createSocketServer(httpServer: HttpServer) {

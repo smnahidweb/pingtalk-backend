@@ -12,6 +12,9 @@ const environmentSchema = z.object({
     .refine((value) => value.startsWith("postgresql://") || value.startsWith("postgres://")),
   BETTER_AUTH_SECRET: z.string().min(32),
   BETTER_AUTH_URL: z.string().url(),
+  CLOUDINARY_CLOUD_NAME: z.string().min(1).optional().or(z.literal("")),
+  CLOUDINARY_API_KEY: z.string().min(1).optional().or(z.literal("")),
+  CLOUDINARY_API_SECRET: z.string().min(1).optional().or(z.literal("")),
 });
 
 const parsedEnvironment = environmentSchema.safeParse(process.env);
@@ -34,6 +37,17 @@ if (
 ) {
   throw new Error(
     "Invalid backend environment configuration. CORS_ORIGIN must match FRONTEND_URL.",
+  );
+}
+
+const cloudinaryVariables = [
+  parsedEnvironment.data.CLOUDINARY_CLOUD_NAME,
+  parsedEnvironment.data.CLOUDINARY_API_KEY,
+  parsedEnvironment.data.CLOUDINARY_API_SECRET,
+];
+if (cloudinaryVariables.some(Boolean) && !cloudinaryVariables.every(Boolean)) {
+  throw new Error(
+    "Invalid backend environment configuration. Set all Cloudinary variables or leave them unset.",
   );
 }
 

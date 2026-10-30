@@ -51,7 +51,7 @@ export function createSocketServer(httpServer: HttpServer) {
     transports: ["websocket", "polling"],
     connectionStateRecovery: {
       maxDisconnectionDuration: 120_000,
-      skipMiddlewares: true,
+      skipMiddlewares: false,
     },
   });
 
@@ -66,14 +66,38 @@ export function createSocketServer(httpServer: HttpServer) {
       });
 
       if (!session) {
-        throw new Error("UNAUTHENTICATED");
+        logger.warn(
+          {
+            origin: headers.origin,
+            transport: socket.conn.transport.name,
+            hasCookie: Boolean(headers.cookie),
+          },
+          "Socket authentication rejected: no Better Auth session",
+        );
+        next(new Error("UNAUTHENTICATED"));
+        return;
       }
 
       socket.data.user = session.user;
+      logger.info(
+        {
+          userId: session.user.id,
+          transport: socket.conn.transport.name,
+        },
+        "Socket authentication succeeded",
+      );
       next();
     } catch (error) {
-      logger.warn({ error }, "Rejected socket connection due to failed auth");
-      next(new Error("UNAUTHENTICATED"));
+      logger.error(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          origin: socket.request.headers.origin,
+          transport: socket.conn.transport.name,
+          hasCookie: Boolean(socket.request.headers.cookie),
+        },
+        "Socket authentication lookup failed",
+      );
+      next(new Error("AUTH_LOOKUP_FAILED"));
     }
   });
 
@@ -84,21 +108,34 @@ export function createSocketServer(httpServer: HttpServer) {
     userSet.add(socket.id);
     userSockets.set(userId, userSet);
 
-    await prisma.conversationMember
-      .findMany({
+    try {
+      const memberships = await prisma.conversationMember.findMany({
         where: { userId },
         select: { conversationId: true },
-      })
-      .then((memberships) => {
-        for (const membership of memberships) {
-          void socket.join(`conversation:${membership.conversationId}`);
-        }
-      })
-      .catch((error) => {
-        logger.warn({ error, userId }, "Unable to sync conversation memberships for socket");
       });
+      await Promise.all(
+        memberships.map(({ conversationId }) =>
+          socket.join(`conversation:${conversationId}`),
+        ),
+      );
+      logger.info(
+        { userId, socketId: socket.id, conversationRoomCount: memberships.length },
+        "Authenticated socket connected and conversation rooms joined",
+      );
+    } catch (error) {
+      logger.error(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          userId,
+          socketId: socket.id,
+        },
+        "Unable to join authenticated socket to conversation rooms",
+      );
+      socket.disconnect(true);
+      return;
+    }
 
-    void socket.join(`user:${userId}`);
+    await socket.join(`user:${userId}`);
 
     if (userSet.size === 1) {
       io.emit("user:online", { userId });
@@ -189,6 +226,7 @@ export function createSocketServer(httpServer: HttpServer) {
     });
 
     socket.on("disconnect", () => {
+      logger.info({ userId, socketId: socket.id }, "Authenticated socket disconnected");
       const activeSockets = userSockets.get(userId);
       activeSockets?.delete(socket.id);
       if (!activeSockets || activeSockets.size === 0) {

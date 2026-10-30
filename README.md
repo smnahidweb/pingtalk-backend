@@ -38,7 +38,7 @@ application runtime connection.
 `CORS_ORIGIN` must be the exact frontend origin (without a path or trailing
 slash), and the auth secret must contain at least 32 characters. Startup
 validation reports variable names only; it never prints configured values.
-Profile-photo uploads additionally require all three server-only values:
+Profile-photo and conversation-file uploads require all three server-only values:
 `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and
 `CLOUDINARY_API_SECRET`. Leave all three unset to disable uploads; the backend
 continues to start and users can still remove an existing photo. Never expose
@@ -72,11 +72,13 @@ when `DIRECT_URL` is unset, which keeps existing local setup working; set
 The health endpoint verifies that the API process is responsive; it does not
 perform a database connectivity check. No database migration is run as part of
 the application build or start commands.
-Before releasing reaction support, apply the checked-in additive migration
-with `npm run db:deploy` against the existing production database. It creates
-the reaction table and constraints without resetting or rewriting existing
-records. Configure the three Cloudinary variables on Render before enabling
-profile-photo uploads; no frontend storage secret or URL change is required.
+The checked-in migrations are additive. Before releasing presence and
+attachments, confirm the production database target and migration status, then
+apply pending migrations with `npm run db:deploy`; this adds a nullable
+last-seen column and the attachment table without resetting or
+rewriting existing records. Do not run that command against production without
+explicit approval. Configure the three Cloudinary variables on Render; no
+frontend storage secret or additional URL is required.
 
 ## API
 
@@ -85,7 +87,7 @@ profile-photo uploads; no frontend storage secret or URL change is required.
   session retrieval).
 - Authenticated profile endpoints: `GET/PATCH /api/me`,
   `POST/DELETE /api/me/image`, and `GET /api/users/:userId`. Upload a raw JPEG,
-  PNG, or WebP body (maximum 5 MB) to `POST /api/me/image`; the backend validates
+  PNG, or WebP body (maximum 4 MB) to `POST /api/me/image`; the backend validates
   the file signature and stores it in Cloudinary using server-side credentials.
   Photo removal clears the authenticated user's image and removes the app-owned
   Cloudinary asset when storage is configured. The existing `PATCH /api/me`
@@ -116,6 +118,24 @@ profile-photo uploads; no frontend storage secret or URL change is required.
   😮, 😢, and 😡. Each user has at most one reaction per message. Message
   history includes reactions, and authorized changes are broadcast through the
   existing Socket.IO conversation room as `message:reactions`.
+- Image and PDF attachments are sent as a raw file body to
+  `POST /api/conversations/:conversationId/attachments`. The authenticated
+  sender must be a conversation member. JPEG, PNG, WebP, and PDF file signatures
+  are checked on the server; files are capped at 4 MB, uploaded as authenticated
+  Cloudinary assets, and associated with one message. Clients provide a UUID
+  idempotency key so retrying a completed upload does not create another message.
+  Message history and `message:new` include metadata and an application delivery
+  URL, never the Cloudinary URL. `GET /api/attachments/:attachmentId/content`
+  requires authentication and checks current conversation membership before
+  proxying the file with private, non-cacheable response headers.
+- Presence uses the authenticated Socket.IO session identity, not client user
+  IDs. The server counts active sockets per user, persists `lastSeenAt` on
+  connection/final disconnect, and refreshes the timestamp while sockets are
+  active. Presence state is process-local: multiple simultaneous backend
+  instances do not share socket counts or broadcasts. Use one instance or add
+  shared presence storage and a Socket.IO adapter before scaling horizontally.
+  Presence updates are emitted to that user's conversation rooms as
+  `user:presence`.
 
 Protected endpoints require the Better Auth session cookie. Conversation
 membership is checked on every conversation/message operation. User search may
@@ -129,6 +149,12 @@ requests under `/api/*` to `NEXT_PUBLIC_API_URL`, making the browser-facing
 requests same-origin and avoiding dependence on third-party cookies between
 the default Vercel and Render domains. The backend CORS configuration still
 allows only the exact configured frontend origin with credentials.
+The frontend also uses the same-origin `/socket.io` proxy so Better Auth cookies
+remain attached. Since the current Vercel proxy does not successfully upgrade
+WebSocket requests, the client is configured for Socket.IO polling only; this
+is a temporary transport limitation, not a WebSocket fix. Polling has more
+HTTP request overhead than a persistent WebSocket and should be re-evaluated
+once the production route supports authenticated upgrades.
 
 Better Auth cookies remain `HttpOnly` and `SameSite=Lax`; they are `Secure` in
 production. Keep HTTPS enabled. The authentication UI confirms the server

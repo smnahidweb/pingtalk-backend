@@ -15,6 +15,7 @@ import {
   type CallUser,
 } from "./call-registry.js";
 import { logger } from "./logger.js";
+import { UserSocketRegistry } from "./presence.js";
 import { prisma } from "./prisma.js";
 import { z } from "zod";
 
@@ -27,6 +28,13 @@ type SerializedMessage = {
   sender: { id: string; name: string; image: string | null };
   read: boolean;
   reactions: Array<{ userId: string; emoji: string }>;
+  attachments: Array<{
+    id: string;
+    fileName: string;
+    contentType: string;
+    fileSize: number;
+    url: string;
+  }>;
 };
 
 type SerializedReaction = { userId: string; emoji: string };
@@ -67,9 +75,14 @@ function emitToCallUsers(
 }
 
 let socketServer: Server | null = null;
+let onlineUsers: UserSocketRegistry | null = null;
 
 export function getSocketServer() {
   return socketServer;
+}
+
+export function getOnlineUserIds(userIds: Iterable<string>) {
+  return onlineUsers?.onlineUserIds(userIds) ?? new Set<string>();
 }
 
 export function emitMessageCreated(conversationId: string, message: SerializedMessage) {
@@ -136,7 +149,8 @@ export function createSocketServer(httpServer: HttpServer) {
   });
 
   socketServer = io;
-  const userSockets = new Map<string, Set<string>>();
+  const userSockets = new UserSocketRegistry();
+  onlineUsers = userSockets;
   const calls = new CallRegistry();
   const callSocketBindings = new Map<
     string,
@@ -164,6 +178,78 @@ export function createSocketServer(httpServer: HttpServer) {
     }
   }, 10_000);
   callExpiryTimer.unref();
+  const presenceHeartbeatTimer = setInterval(() => {
+    const userIds = userSockets.activeUserIds();
+    if (userIds.length === 0) return;
+    void prisma.user
+      .updateMany({
+        where: { id: { in: userIds } },
+        data: { lastSeenAt: new Date() },
+      })
+      .catch((error: unknown) => {
+        logger.error(
+          {
+            errorName: error instanceof Error ? error.name : "UnknownError",
+            activeUserCount: userIds.length,
+          },
+          "Unable to refresh authenticated user presence timestamps",
+        );
+      });
+  }, 60_000);
+  presenceHeartbeatTimer.unref();
+
+  const persistLastSeen = async (userId: string, lastSeenAt: Date) => {
+    try {
+      await prisma.user.updateMany({
+        where: { id: userId },
+        data: { lastSeenAt },
+      });
+    } catch (error) {
+      logger.error(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          userId,
+        },
+        "Unable to persist user last-seen timestamp",
+      );
+    }
+  };
+
+  const emitPresenceToConversationMembers = async (
+    userId: string,
+    isOnline: boolean,
+    lastSeenAt: Date | null,
+  ) => {
+    try {
+      const memberships = await prisma.conversationMember.findMany({
+        where: { userId },
+        select: { conversationId: true },
+      });
+      if (memberships.length === 0) return;
+      io.to(
+        memberships.map(({ conversationId }) => `conversation:${conversationId}`),
+      ).emit("user:presence", {
+        userId,
+        online: isOnline,
+        lastSeenAt: lastSeenAt?.toISOString() ?? null,
+      });
+    } catch (error) {
+      logger.error(
+        {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          userId,
+        },
+        "Unable to broadcast user presence",
+      );
+    }
+  };
+
+  io.on("close", () => {
+    clearInterval(callExpiryTimer);
+    clearInterval(presenceHeartbeatTimer);
+    if (onlineUsers === userSockets) onlineUsers = null;
+    if (socketServer === io) socketServer = null;
+  });
 
   io.engine.on("connection_error", (error) => {
     const requestUrl = new URL(error.req.url ?? "/", "http://localhost");
@@ -257,9 +343,6 @@ export function createSocketServer(httpServer: HttpServer) {
   io.on("connection", async (socket) => {
     const user = socket.data.user as { id: string; name: string; email?: string; image?: string | null };
     const userId = user.id;
-    const userSet = userSockets.get(userId) ?? new Set<string>();
-    userSet.add(socket.id);
-    userSockets.set(userId, userSet);
 
     try {
       const memberships = await prisma.conversationMember.findMany({
@@ -289,6 +372,8 @@ export function createSocketServer(httpServer: HttpServer) {
     }
 
     await socket.join(`user:${userId}`);
+    if (!socket.connected) return;
+    const becameOnline = userSockets.connect(userId, socket.id);
 
     socket.on(
       "call:invite",
@@ -577,10 +662,6 @@ export function createSocketServer(httpServer: HttpServer) {
       },
     );
 
-    if (userSet.size === 1) {
-      io.emit("user:online", { userId });
-    }
-
     socket.on("conversation:join", async (conversationId: string, callback?: (response: { ok: boolean }) => void) => {
       if (typeof conversationId !== "string") {
         callback?.({ ok: false });
@@ -691,14 +772,10 @@ export function createSocketServer(httpServer: HttpServer) {
         },
         "Authenticated socket disconnected",
       );
-      const activeSockets = userSockets.get(userId);
-      activeSockets?.delete(socket.id);
-      const lastSocketDisconnected = !activeSockets || activeSockets.size === 0;
+      const disconnectState = userSockets.disconnect(userId, socket.id);
+      const lastSocketDisconnected = disconnectState.lastSocket;
       const callBinding = callSocketBindings.get(userId);
       const callSocketDisconnected = callBinding?.socketId === socket.id;
-      if (lastSocketDisconnected) {
-        userSockets.delete(userId);
-      }
       if (lastSocketDisconnected || callSocketDisconnected) {
         const callId = calls.activeCallForUser(userId);
         const callBeforeDisconnect = callId ? calls.get(callId) : null;
@@ -724,9 +801,21 @@ export function createSocketServer(httpServer: HttpServer) {
         }
       }
       if (lastSocketDisconnected) {
-        io.emit("user:offline", { userId });
+        const lastSeenAt = new Date();
+        logger.info({ userId, lastSeenAt: lastSeenAt.toISOString() }, "Authenticated user became offline");
+        void persistLastSeen(userId, lastSeenAt).then(() =>
+          userSockets.isOnline(userId)
+            ? Promise.resolve()
+            : emitPresenceToConversationMembers(userId, false, lastSeenAt),
+        );
       }
     });
+    if (becameOnline) {
+      const lastSeenAt = new Date();
+      logger.info({ userId }, "Authenticated user became online");
+      void persistLastSeen(userId, lastSeenAt);
+      void emitPresenceToConversationMembers(userId, true, null);
+    }
   });
 
   return io;

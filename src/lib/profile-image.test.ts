@@ -3,7 +3,11 @@ import { test } from "node:test";
 import { HttpError } from "./errors.js";
 import {
   getProfileImagePublicId,
+  getAuthenticatedCloudinaryAssetUrl,
+  MESSAGE_ATTACHMENT_MAX_BYTES,
   PROFILE_IMAGE_MAX_BYTES,
+  sanitizeAttachmentFileName,
+  validateMessageAttachment,
   validateProfileImage,
 } from "./profile-image.js";
 
@@ -48,4 +52,66 @@ test("Cloudinary profile asset IDs are stable and do not expose account IDs", ()
   assert.notEqual(first, getProfileImagePublicId("another-user"));
   assert.equal(first.includes("user-secret-id"), false);
   assert.match(first, /^pingtalk\/profiles\/[a-f0-9]{64}$/);
+});
+
+test("private attachment URLs must be authenticated assets from the configured Cloudinary account", () => {
+  const valid =
+    "https://res.cloudinary.com/pingtalk/image/authenticated/s--signed--/pingtalk/file";
+  assert.equal(
+    getAuthenticatedCloudinaryAssetUrl(valid, "pingtalk", "image"),
+    valid,
+  );
+  for (const invalid of [
+    "https://example.invalid/pingtalk/image/authenticated/file",
+    "https://res.cloudinary.com/other/image/authenticated/file",
+    "https://res.cloudinary.com/pingtalk/image/upload/file",
+    "https://res.cloudinary.com/pingtalk/raw/authenticated/file",
+    "http://res.cloudinary.com/pingtalk/image/authenticated/file",
+  ]) {
+    assert.throws(
+      () => getAuthenticatedCloudinaryAssetUrl(invalid, "pingtalk", "image"),
+      (error: unknown) =>
+        error instanceof HttpError && error.code === "FILE_STORAGE_FAILED",
+    );
+  }
+});
+
+test("message attachment validation accepts supported image signatures and PDFs", () => {
+  validateMessageAttachment(
+    Buffer.from([0xff, 0xd8, 0xff, 0x00]),
+    "image/jpeg",
+  );
+  validateMessageAttachment(
+    Buffer.from("%PDF-1.7\n", "ascii"),
+    "application/pdf",
+  );
+  assert.throws(
+    () => validateMessageAttachment(Buffer.from("<svg/>"), "image/svg+xml"),
+    (error: unknown) =>
+      error instanceof HttpError && error.code === "UNSUPPORTED_FILE_TYPE",
+  );
+  assert.throws(
+    () => validateMessageAttachment(Buffer.from("not pdf"), "application/pdf"),
+    (error: unknown) =>
+      error instanceof HttpError && error.code === "INVALID_FILE",
+  );
+  assert.throws(
+    () =>
+      validateMessageAttachment(
+        Buffer.alloc(MESSAGE_ATTACHMENT_MAX_BYTES + 1),
+        "application/pdf",
+      ),
+    (error: unknown) =>
+      error instanceof HttpError && error.status === 413,
+  );
+});
+
+test("attachment filenames are reduced to safe basenames", () => {
+  assert.equal(sanitizeAttachmentFileName("../../report.pdf"), "report.pdf");
+  assert.equal(sanitizeAttachmentFileName("folder\\image.png"), "image.png");
+  assert.throws(
+    () => sanitizeAttachmentFileName("../"),
+    (error: unknown) =>
+      error instanceof HttpError && error.code === "INVALID_FILE_NAME",
+  );
 });

@@ -6,6 +6,7 @@ import {
   emitMessageReactionsUpdated,
   emitReadReceipt,
   emitUserProfileUpdated,
+  getOnlineUserIds,
 } from "../lib/socket.js";
 import { HttpError, asyncRoute } from "../lib/errors.js";
 import {
@@ -14,12 +15,19 @@ import {
   type MessageReactionStore,
 } from "../lib/message-reactions.js";
 import {
+  deleteCloudinaryAsset,
   deleteProfileImage,
+  fetchPrivateMessageAttachment,
   isProfileImageStorageConfigured,
+  MESSAGE_ATTACHMENT_MAX_BYTES,
   PROFILE_IMAGE_MAX_BYTES,
+  sanitizeAttachmentFileName,
+  uploadMessageAttachment,
   uploadProfileImage,
+  validateMessageAttachment,
   validateProfileImage,
 } from "../lib/profile-image.js";
+import { logger } from "../lib/logger.js";
 import {
   canManageConversation,
   canModifyMessage,
@@ -52,6 +60,23 @@ function requireUser(request: import("express").Request): string {
   return request.user.id;
 }
 
+function serializeAttachments<T extends { id: string }>(attachments: T[]) {
+  return attachments.map(({ id, ...attachment }) => ({
+    ...attachment,
+    id,
+    url: `/api/attachments/${encodeURIComponent(id)}/content`,
+  }));
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "P2002"
+  );
+}
+
 async function requireMembership(conversationId: string, userId: string) {
   const membership = await prisma.conversationMember.findUnique({
     where: { conversationId_userId: { conversationId, userId } },
@@ -62,6 +87,14 @@ async function requireMembership(conversationId: string, userId: string) {
   }
   return membership;
 }
+
+const requireAttachmentMembership: import("express").RequestHandler<RouteParams> =
+  async (request, _response, next) => {
+    const userId = requireUser(request);
+    const { conversationId } = conversationIdParamsSchema.parse(request.params);
+    await requireMembership(conversationId, userId);
+    next();
+  };
 
 async function requireMessageAccess(messageId: string, userId: string) {
   const message = await prisma.message.findFirst({
@@ -120,6 +153,7 @@ apiRouter.get(
         name: true,
         email: true,
         image: true,
+        lastSeenAt: true,
         createdAt: true,
         profile: { select: { statusMessage: true } },
       },
@@ -140,7 +174,9 @@ apiRouter.patch(
           where: { id: userId },
           data: {
             ...(profileInput.name !== undefined ? { name: profileInput.name } : {}),
-            ...(profileInput.image !== undefined ? { image: profileInput.image } : {}),
+            ...(profileInput.image !== undefined
+              ? { image: profileInput.image }
+              : {}),
           },
         });
       }
@@ -228,19 +264,39 @@ apiRouter.get(
   asyncRoute<RouteParams>(async (request, response) => {
     const currentUserId = requireUser(request);
     const { userId } = userParamsSchema.parse(request.params);
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        name: true,
-        image: true,
-        profile: { select: { statusMessage: true } },
-      },
-    });
+    const [user, sharedConversation] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          name: true,
+          image: true,
+          lastSeenAt: true,
+          profile: { select: { statusMessage: true } },
+        },
+      }),
+      prisma.conversationMember.findFirst({
+        where: {
+          userId,
+          conversation: {
+            memberships: { some: { userId: currentUserId } },
+          },
+        },
+        select: { id: true },
+      }),
+    ]);
     if (!user || user.id === currentUserId) {
       throw new HttpError(404, "USER_NOT_FOUND", "That user could not be found.");
     }
-    response.json({ user });
+    response.json({
+      user: {
+        ...user,
+        lastSeenAt: sharedConversation ? user.lastSeenAt : null,
+        online:
+          Boolean(sharedConversation) &&
+          getOnlineUserIds([user.id]).has(user.id),
+      },
+    });
   }),
 );
 
@@ -305,7 +361,9 @@ apiRouter.get(
           select: {
             userId: true,
             role: true,
-            user: { select: { id: true, name: true, image: true } },
+            user: {
+              select: { id: true, name: true, image: true, lastSeenAt: true },
+            },
           },
         },
         messages: {
@@ -318,6 +376,7 @@ apiRouter.get(
             deletedAt: true,
             senderId: true,
             sender: { select: { name: true } },
+            attachments: { select: { fileName: true }, take: 1 },
           },
         },
         _count: { select: { memberships: true } },
@@ -355,7 +414,9 @@ apiRouter.get(
         const lastMessage = latestMessage
           ? latestMessage.deletedAt
             ? "Message deleted"
-            : latestMessage.content
+            : latestMessage.content ||
+              latestMessage.attachments[0]?.fileName ||
+              "Attachment"
           : "";
 
         return {
@@ -381,6 +442,8 @@ apiRouter.get(
                 ? "You"
                 : membership.user.name,
             image: membership.user.image,
+            lastSeenAt: membership.user.lastSeenAt,
+            online: getOnlineUserIds([membership.userId]).has(membership.userId),
             role: membership.role,
           })),
         };
@@ -414,7 +477,9 @@ apiRouter.get(
             userId: true,
             role: true,
             joinedAt: true,
-            user: { select: { id: true, name: true, image: true } },
+            user: {
+              select: { id: true, name: true, image: true, lastSeenAt: true },
+            },
           },
         },
         _count: { select: { memberships: true } },
@@ -428,11 +493,12 @@ apiRouter.get(
         createdAt: conversation.createdAt,
         updatedAt: conversation.updatedAt,
         memberCount: conversation._count.memberships,
-        members: conversation.memberships.map((membership) => ({
+          members: conversation.memberships.map((membership) => ({
           ...membership.user,
-          role: membership.role,
-          joinedAt: membership.joinedAt,
-        })),
+            online: getOnlineUserIds([membership.userId]).has(membership.userId),
+            role: membership.role,
+            joinedAt: membership.joinedAt,
+          })),
       },
     });
   }),
@@ -464,7 +530,9 @@ apiRouter.get(
         userId: true,
         role: true,
         joinedAt: true,
-        user: { select: { id: true, name: true, image: true } },
+        user: {
+          select: { id: true, name: true, image: true, lastSeenAt: true },
+        },
       },
     });
     const hasMore = memberships.length > limit;
@@ -472,6 +540,7 @@ apiRouter.get(
     response.json({
       participants: page.map(({ user, role, joinedAt }) => ({
         ...user,
+        online: getOnlineUserIds([user.id]).has(user.id),
         role,
         joinedAt,
       })),
@@ -739,6 +808,15 @@ apiRouter.get(
         reactions: {
           select: { userId: true, emoji: true },
         },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            contentType: true,
+            fileSize: true,
+            url: true,
+          },
+        },
       },
     });
     const hasMore = messages.length > limit;
@@ -752,6 +830,7 @@ apiRouter.get(
         deletedAt: message.deletedAt,
         sender: message.sender,
         reactions: message.reactions,
+        attachments: message.deletedAt ? [] : serializeAttachments(message.attachments),
         read:
           message.sender.id === userId
             ? message.readReceipts.some((receipt) => receipt.userId !== userId)
@@ -776,6 +855,15 @@ apiRouter.post(
         include: {
           sender: { select: { id: true, name: true, image: true } },
           reactions: { select: { userId: true, emoji: true } },
+          attachments: {
+            select: {
+              id: true,
+              fileName: true,
+              contentType: true,
+              fileSize: true,
+              url: true,
+            },
+          },
         },
       });
       await transaction.conversation.update({
@@ -793,12 +881,258 @@ apiRouter.post(
       deletedAt: message.deletedAt,
       sender: message.sender,
       reactions: message.reactions,
+      attachments: serializeAttachments(message.attachments),
       read: false,
     };
 
     emitMessageCreated(conversationId, serializedMessage);
 
     response.status(201).json({ message: serializedMessage });
+  }),
+);
+
+apiRouter.post(
+  "/conversations/:conversationId/attachments",
+  requireAttachmentMembership,
+  express.raw({ type: () => true, limit: MESSAGE_ATTACHMENT_MAX_BYTES }),
+  asyncRoute<RouteParams>(async (request, response) => {
+    const userId = requireUser(request);
+    const { conversationId } = conversationIdParamsSchema.parse(request.params);
+    await requireMembership(conversationId, userId);
+
+    const contentType = (request.get("content-type")?.split(";")[0] ?? "")
+      .trim()
+      .toLowerCase();
+    const uploadId = request.get("x-upload-id")?.trim() ?? "";
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        uploadId,
+      )
+    ) {
+      throw new HttpError(400, "INVALID_UPLOAD_ID", "The upload request is invalid.");
+    }
+    if (!Buffer.isBuffer(request.body)) {
+      throw new HttpError(400, "INVALID_FILE", "The request must contain a file.");
+    }
+    let fileName: string;
+    try {
+      fileName = sanitizeAttachmentFileName(
+        decodeURIComponent(request.get("x-file-name") ?? ""),
+      );
+    } catch (error) {
+      if (error instanceof URIError) {
+        throw new HttpError(400, "INVALID_FILE_NAME", "Choose a file with a valid name.");
+      }
+      throw error;
+    }
+    validateMessageAttachment(request.body, contentType);
+
+    const existing = await prisma.messageAttachment.findUnique({
+      where: { uploadId },
+      include: {
+        message: {
+          include: {
+            sender: { select: { id: true, name: true, image: true } },
+            reactions: { select: { userId: true, emoji: true } },
+            attachments: {
+              select: {
+                id: true,
+                fileName: true,
+                contentType: true,
+                fileSize: true,
+                url: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    if (existing) {
+      if (
+        existing.message.senderId !== userId ||
+        existing.message.conversationId !== conversationId
+      ) {
+        throw new HttpError(409, "UPLOAD_ID_REUSED", "This upload request was already used.");
+      }
+      response.json({
+        message: {
+          id: existing.message.id,
+          content: existing.message.content,
+          createdAt: existing.message.createdAt,
+          editedAt: existing.message.editedAt,
+          deletedAt: existing.message.deletedAt,
+          sender: existing.message.sender,
+          reactions: existing.message.reactions,
+          attachments: serializeAttachments(existing.message.attachments),
+          read: false,
+        },
+      });
+      return;
+    }
+
+    const uploaded = await uploadMessageAttachment(
+      conversationId,
+      userId,
+      request.body,
+      contentType,
+      fileName,
+      uploadId,
+    );
+    try {
+      const message = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.message.create({
+          data: {
+            conversationId,
+            senderId: userId,
+            content: "",
+            attachments: { create: uploaded },
+          },
+          include: {
+            sender: { select: { id: true, name: true, image: true } },
+            reactions: { select: { userId: true, emoji: true } },
+            attachments: {
+              select: {
+                id: true,
+                fileName: true,
+                contentType: true,
+                fileSize: true,
+                url: true,
+              },
+            },
+          },
+        });
+        await transaction.conversation.update({
+          where: { id: conversationId },
+          data: { updatedAt: new Date() },
+        });
+        return created;
+      });
+      const serializedMessage = {
+        id: message.id,
+        content: message.content,
+        createdAt: message.createdAt,
+        editedAt: message.editedAt,
+        deletedAt: message.deletedAt,
+        sender: message.sender,
+        reactions: message.reactions,
+        attachments: serializeAttachments(message.attachments),
+        read: false,
+      };
+      emitMessageCreated(conversationId, serializedMessage);
+      response.status(201).json({ message: serializedMessage });
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        const duplicate = await prisma.messageAttachment.findUnique({
+          where: { uploadId },
+          include: {
+            message: {
+              include: {
+                sender: { select: { id: true, name: true, image: true } },
+                reactions: { select: { userId: true, emoji: true } },
+                attachments: {
+                  select: {
+                    id: true,
+                    fileName: true,
+                    contentType: true,
+                    fileSize: true,
+                    url: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+        if (
+          duplicate &&
+          duplicate.message.senderId === userId &&
+          duplicate.message.conversationId === conversationId
+        ) {
+          response.json({
+            message: {
+              id: duplicate.message.id,
+              content: duplicate.message.content,
+              createdAt: duplicate.message.createdAt,
+              editedAt: duplicate.message.editedAt,
+              deletedAt: duplicate.message.deletedAt,
+              sender: duplicate.message.sender,
+              reactions: duplicate.message.reactions,
+              attachments: serializeAttachments(duplicate.message.attachments),
+              read: false,
+            },
+          });
+          return;
+        }
+      }
+      try {
+        await deleteCloudinaryAsset(
+          uploaded.publicId,
+          uploaded.resourceType,
+          undefined,
+          "authenticated",
+        );
+      } catch (cleanupError) {
+        logger.error(
+          {
+            errorName:
+              cleanupError instanceof Error ? cleanupError.name : "UnknownError",
+            conversationId,
+          },
+          "Unable to clean up an attachment after message persistence failed",
+        );
+      }
+      throw error;
+    }
+  }),
+);
+
+apiRouter.get(
+  "/attachments/:attachmentId/content",
+  asyncRoute<RouteParams>(async (request, response) => {
+    const userId = requireUser(request);
+    const attachmentId = request.params.attachmentId;
+    if (!attachmentId) {
+      throw new HttpError(400, "INVALID_ATTACHMENT", "The requested file is invalid.");
+    }
+    const attachment = await prisma.messageAttachment.findFirst({
+      where: {
+        id: attachmentId,
+        message: {
+          deletedAt: null,
+          conversation: { memberships: { some: { userId } } },
+        },
+      },
+      select: {
+        url: true,
+        fileName: true,
+        contentType: true,
+        fileSize: true,
+        resourceType: true,
+      },
+    });
+    if (!attachment) {
+      throw new HttpError(404, "NOT_FOUND", "File not found.");
+    }
+    if (attachment.resourceType !== "image" && attachment.resourceType !== "raw") {
+      throw new HttpError(500, "FILE_STORAGE_FAILED", "Stored file metadata is invalid.");
+    }
+    const content = await fetchPrivateMessageAttachment(
+      attachment.url,
+      attachment.resourceType,
+      attachment.fileSize,
+    );
+    const disposition =
+      attachment.contentType === "application/pdf" ? "attachment" : "inline";
+    response
+      .set("Content-Type", attachment.contentType)
+      .set(
+        "Content-Disposition",
+        `${disposition}; filename*=UTF-8''${encodeURIComponent(attachment.fileName)}`,
+      )
+      .set("Content-Length", String(content.byteLength))
+      .set("Cache-Control", "private, no-store")
+      .set("X-Content-Type-Options", "nosniff")
+      .set("Referrer-Policy", "no-referrer")
+      .send(content);
   }),
 );
 

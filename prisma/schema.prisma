@@ -19,20 +19,21 @@ enum ConversationRole {
 }
 
 model User {
-  id                 String              @id
-  name               String              @db.VarChar(120)
-  email              String              @unique @db.VarChar(320)
-  emailVerified      Boolean             @default(false)
-  image              String?
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  sessions           Session[]
-  accounts           Account[]
-  profile            UserProfile?
-  memberships        ConversationMember[]
-  sentMessages       Message[]           @relation("MessageSender")
-  readReceipts       MessageReadReceipt[]
-  reactions          MessageReaction[]
+  id            String               @id
+  name          String               @db.VarChar(120)
+  email         String               @unique @db.VarChar(320)
+  emailVerified Boolean              @default(false)
+  image         String?
+  lastSeenAt    DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+  sessions      Session[]
+  accounts      Account[]
+  profile       UserProfile?
+  memberships   ConversationMember[]
+  sentMessages  Message[]            @relation("MessageSender")
+  readReceipts  MessageReadReceipt[]
+  reactions     MessageReaction[]
 
   @@index([name])
 }
@@ -118,18 +119,19 @@ model ConversationMember {
 }
 
 model Message {
-  id             String              @id @default(cuid())
+  id             String               @id @default(cuid())
   conversationId String
   senderId       String
-  content        String              @db.VarChar(8000)
-  createdAt      DateTime            @default(now())
-  updatedAt      DateTime            @updatedAt
+  content        String               @db.VarChar(8000)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
   editedAt       DateTime?
   deletedAt      DateTime?
-  conversation   Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  sender         User                @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  conversation   Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User                 @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   readReceipts   MessageReadReceipt[]
   reactions      MessageReaction[]
+  attachments    MessageAttachment[]
 
   @@index([conversationId, createdAt, id])
   @@index([senderId, createdAt])
@@ -160,4 +162,20 @@ model MessageReaction {
   @@unique([messageId, userId])
   @@index([messageId, emoji])
   @@index([userId])
+}
+
+model MessageAttachment {
+  id           String   @id @default(cuid())
+  messageId    String
+  uploadId     String   @unique
+  fileName     String   @db.VarChar(255)
+  contentType  String   @db.VarChar(100)
+  fileSize     Int
+  url          String
+  publicId     String   @unique
+  resourceType String   @db.VarChar(10)
+  createdAt    DateTime @default(now())
+  message      Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
 }

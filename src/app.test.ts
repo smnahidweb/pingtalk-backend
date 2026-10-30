@@ -46,6 +46,23 @@ test("CORS does not reflect an untrusted origin", async () => {
   assert.equal(response.headers["access-control-allow-origin"], undefined);
 });
 
+test("CORS permits the attachment upload headers from the configured frontend", async () => {
+  const response = await request(app)
+    .options("/api/conversations/conversation-id/attachments")
+    .set("Origin", env.CORS_ORIGIN)
+    .set("Access-Control-Request-Method", "POST")
+    .set("Access-Control-Request-Headers", "content-type,x-file-name,x-upload-id");
+  assert.equal(response.status, 204);
+  assert.match(
+    response.headers["access-control-allow-headers"] ?? "",
+    /X-File-Name/i,
+  );
+  assert.match(
+    response.headers["access-control-allow-headers"] ?? "",
+    /X-Upload-Id/i,
+  );
+});
+
 test("Railway ingress trusts one proxy hop for rate-limited routes", async () => {
   const originalRailwayEnvironment = process.env.RAILWAY_ENVIRONMENT;
   process.env.RAILWAY_ENVIRONMENT = "production";
@@ -132,7 +149,7 @@ test("protected profile endpoint rejects unauthenticated requests", async () => 
   });
 
   test("profile photo mutations and message reactions require authentication", async () => {
-    const [upload, remove, reaction] = await Promise.all([
+    const [upload, remove, reaction, attachment, attachmentContent] = await Promise.all([
       request(app)
         .post("/api/me/image")
         .set("Content-Type", "image/png")
@@ -141,9 +158,18 @@ test("protected profile endpoint rejects unauthenticated requests", async () => 
       request(app)
         .post("/api/messages/message-id/reactions")
         .send({ emoji: "👍" }),
+      request(app)
+        .post("/api/conversations/conversation-id/attachments")
+        .set("Content-Type", "application/pdf")
+        .set("X-File-Name", "report.pdf")
+        .set("X-Upload-Id", "b67d30b4-9f4f-4e8d-a5a2-f70ea35fe61f")
+        .send(Buffer.from("%PDF-1.7\n", "ascii")),
+      request(app).get("/api/attachments/attachment-id/content"),
     ]);
     assert.equal(upload.status, 401);
     assert.equal(remove.status, 401);
     assert.equal(reaction.status, 401);
+    assert.equal(attachment.status, 401);
+    assert.equal(attachmentContent.status, 401);
   });
 });

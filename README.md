@@ -141,11 +141,19 @@ conversation reuse, group creation/management/ownership transfer, message
 history/edit/delete, member authorization, and read-receipt smoke tests.
 Temporary test accounts and conversations were deleted afterward.
 
-## Future realtime transport
+## Realtime calls
 
-No Socket.IO or LiveKit server is enabled. A future Socket.IO handshake should
-pass the request cookies to Better Auth's `auth.api.getSession`, reject
-connections without a valid session, and derive the user ID only from that
-verified session. Before joining or broadcasting to a conversation room, query
-the current conversation membership and authorize the requested operation on
-the server.
+Audio and video calls use the existing authenticated Socket.IO connection for
+call invitations and WebRTC offer/answer/ICE signaling. The server validates
+the Better Auth session, derives the caller identity from that session, and
+checks conversation membership before creating a call. A call supports up to
+eight participants, including the caller. Call state is temporary and held in
+the backend process; a process restart ends calls, and multiple backend
+instances do not share call state.
+
+Media is peer-to-peer WebRTC mesh and is not relayed through the API. Google
+STUN servers are configured for NAT discovery, but there is no TURN relay, so
+some restrictive networks may prevent media from connecting. In an eight-person
+call each device can send media to up to seven peers, which increases bandwidth
+and device load. These calls are intended for small groups, not large meetings.
+Both backend and frontend deployments must be updated to release call changes.

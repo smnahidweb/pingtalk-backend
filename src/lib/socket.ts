@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fromNodeHeaders } from "better-auth/node";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
@@ -5,8 +6,17 @@ import type { Transport } from "engine.io";
 import { Server } from "socket.io";
 import { env } from "../config/env.js";
 import { auth } from "./auth.js";
+import {
+  CallRegistry,
+  CallRegistryError,
+  type CallMode,
+  type CallSnapshot,
+  type CallSignalType,
+  type CallUser,
+} from "./call-registry.js";
 import { logger } from "./logger.js";
 import { prisma } from "./prisma.js";
+import { z } from "zod";
 
 type SerializedMessage = {
   id: string;
@@ -17,6 +27,41 @@ type SerializedMessage = {
   sender: { id: string; name: string; image: string | null };
   read: boolean;
 };
+
+type SocketAck = (result: {
+  ok: boolean;
+  call?: ReturnType<CallRegistry["get"]>;
+  error?: { code: string; message: string };
+}) => void;
+
+const callInviteSchema = z.object({
+  conversationId: z.string().min(1).max(128),
+  callType: z.enum(["AUDIO", "VIDEO"]),
+  participantIds: z
+    .array(z.string().min(1).max(128))
+    .min(1)
+    .max(7)
+    .refine((ids) => new Set(ids).size === ids.length)
+    .optional(),
+});
+const callIdSchema = z.object({ callId: z.string().uuid() });
+const callSignalSchema = z.object({
+  callId: z.string().uuid(),
+  toUserId: z.string().min(1).max(128),
+  signalType: z.enum(["offer", "answer", "ice"]),
+  data: z.record(z.string(), z.unknown()),
+});
+const CALL_SIGNAL_MAX_BYTES = 64 * 1024;
+const MAX_GROUP_CALL_PARTICIPANTS = 8;
+
+function emitToCallUsers(
+  io: Server,
+  userIds: string[],
+  event: string,
+  payload: unknown,
+) {
+  for (const userId of new Set(userIds)) io.to(`user:${userId}`).emit(event, payload);
+}
 
 let socketServer: Server | null = null;
 
@@ -59,6 +104,33 @@ export function createSocketServer(httpServer: HttpServer) {
 
   socketServer = io;
   const userSockets = new Map<string, Set<string>>();
+  const calls = new CallRegistry();
+  const callSocketBindings = new Map<
+    string,
+    { callId: string; socketId: string }
+  >();
+  const clearCallSocketBindings = (call: CallSnapshot) => {
+    for (const userId of [
+      ...call.participants.map((participant) => participant.id),
+      ...call.pendingUserIds,
+    ]) {
+      if (callSocketBindings.get(userId)?.callId === call.id) {
+        callSocketBindings.delete(userId);
+      }
+    }
+  };
+  const callExpiryTimer = setInterval(() => {
+    for (const call of calls.expire()) {
+      clearCallSocketBindings(call);
+      emitToCallUsers(
+        io,
+        [call.caller.id, ...call.pendingUserIds],
+        "call:ended",
+        { callId: call.id, reason: "no-answer" },
+      );
+    }
+  }, 10_000);
+  callExpiryTimer.unref();
 
   io.engine.on("connection_error", (error) => {
     const requestUrl = new URL(error.req.url ?? "/", "http://localhost");
@@ -185,6 +257,293 @@ export function createSocketServer(httpServer: HttpServer) {
 
     await socket.join(`user:${userId}`);
 
+    socket.on(
+      "call:invite",
+      async (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const { conversationId, callType, participantIds } =
+            callInviteSchema.parse(payload);
+          const memberships = await prisma.conversationMember.findMany({
+            where: { conversationId },
+            select: {
+              userId: true,
+              user: { select: { id: true, name: true, image: true } },
+            },
+            orderBy: [{ joinedAt: "asc" }, { id: "asc" }],
+          });
+          const callerMembership = memberships.find(
+            (membership) => membership.userId === userId,
+          );
+          if (!callerMembership) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "FORBIDDEN", message: "You are not in this conversation." },
+            });
+            return;
+          }
+
+          const conversation = await prisma.conversation.findUnique({
+            where: { id: conversationId },
+            select: { type: true, title: true },
+          });
+          if (!conversation) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "NOT_FOUND", message: "Conversation not found." },
+            });
+            return;
+          }
+
+          const mode: CallMode =
+            conversation.type === "PRIVATE" ? "ONE_TO_ONE" : "GROUP";
+          const caller: CallUser = {
+            id: callerMembership.user.id,
+            name: callerMembership.user.name,
+            image: callerMembership.user.image,
+          };
+          const allInvitees: CallUser[] = memberships
+            .filter((membership) => membership.userId !== userId)
+            .map(({ user }) => ({
+              id: user.id,
+              name: user.name,
+              image: user.image,
+            }));
+
+          if (mode === "ONE_TO_ONE" && participantIds) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "INVALID_PAYLOAD", message: "Private calls do not accept a participant list." },
+            });
+            return;
+          }
+
+          if (mode === "ONE_TO_ONE" && allInvitees.length !== 1) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "INVALID_CONVERSATION", message: "This private conversation is invalid." },
+            });
+            return;
+          }
+
+          const inviteeIds = new Set(participantIds);
+          const invitees =
+            mode === "GROUP" && inviteeIds.size > 0
+              ? allInvitees.filter((invitee) => inviteeIds.has(invitee.id))
+              : allInvitees.slice(0, MAX_GROUP_CALL_PARTICIPANTS - 1);
+          if (
+            inviteeIds.size > 0 &&
+            (invitees.length !== inviteeIds.size || invitees.length > MAX_GROUP_CALL_PARTICIPANTS - 1)
+          ) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "INVALID_PARTICIPANT", message: "One or more call participants are not in this conversation." },
+            });
+            return;
+          }
+          const call = calls.create({
+            id: randomUUID(),
+            conversationId,
+            conversationName:
+              conversation.title ??
+              allInvitees[0]?.name ??
+              caller.name,
+            callType,
+            mode,
+            caller,
+            invitees,
+          });
+          callSocketBindings.set(userId, { callId: call.id, socketId: socket.id });
+
+          acknowledge?.({ ok: true, call });
+          emitToCallUsers(
+            io,
+            call.pendingUserIds,
+            "call:incoming",
+            { call },
+          );
+          logger.info(
+            {
+              callId: call.id,
+              conversationId,
+              callType,
+              mode,
+              initiatorId: userId,
+              inviteeCount: call.pendingUserIds.length,
+            },
+            "Call invitation created",
+          );
+        } catch (error) {
+          if (error instanceof CallRegistryError || error instanceof z.ZodError) {
+            acknowledge?.({
+              ok: false,
+              error: {
+                code:
+                  error instanceof CallRegistryError
+                    ? error.code
+                    : "INVALID_PAYLOAD",
+                message:
+                  error instanceof CallRegistryError
+                    ? error.message
+                    : "Invalid call invitation.",
+              },
+            });
+            return;
+          }
+          logger.error(
+            { errorName: error instanceof Error ? error.name : "UnknownError", userId },
+            "Failed to create call invitation",
+          );
+          acknowledge?.({
+            ok: false,
+            error: { code: "INTERNAL_ERROR", message: "Unable to start the call." },
+          });
+        }
+      },
+    );
+
+    socket.on(
+      "call:accept",
+      (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const { callId } = callIdSchema.parse(payload);
+          const call = calls.accept(callId, userId);
+          callSocketBindings.set(userId, { callId, socketId: socket.id });
+          const participant = call.participants.find((item) => item.id === userId);
+          const others = call.participants.filter((item) => item.id !== userId);
+          io.to(`user:${userId}`)
+            .except(socket.id)
+            .emit("call:accepted-elsewhere", { callId });
+          emitToCallUsers(io, others.map((item) => item.id), "call:participant-joined", {
+            callId,
+            participant,
+          });
+          emitToCallUsers(io, [call.caller.id], "call:accepted", {
+            callId,
+            participant,
+            call,
+          });
+          acknowledge?.({ ok: true, call });
+        } catch (error) {
+          acknowledgeCallError(error, acknowledge, userId, "accept call");
+        }
+      },
+    );
+
+    socket.on(
+      "call:reject",
+      (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const { callId } = callIdSchema.parse(payload);
+          const call = calls.get(callId);
+          const { ended } = calls.reject(callId, userId);
+          if (ended) clearCallSocketBindings(call);
+          emitToCallUsers(io, [call.caller.id], "call:rejected", {
+            callId,
+            userId,
+          });
+          if (ended) {
+            emitToCallUsers(io, [call.caller.id], "call:ended", {
+              callId,
+              reason: "rejected",
+            });
+          }
+          acknowledge?.({ ok: true, call });
+        } catch (error) {
+          acknowledgeCallError(error, acknowledge, userId, "reject call");
+        }
+      },
+    );
+
+    socket.on(
+      "call:cancel",
+      (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const { callId } = callIdSchema.parse(payload);
+          const recipients = calls.get(callId);
+          const call = calls.cancel(callId, userId);
+          clearCallSocketBindings(recipients);
+          emitToCallUsers(
+            io,
+            [recipients.caller.id, ...recipients.pendingUserIds],
+            "call:cancelled",
+            { callId },
+          );
+          acknowledge?.({ ok: true, call });
+        } catch (error) {
+          acknowledgeCallError(error, acknowledge, userId, "cancel call");
+        }
+      },
+    );
+
+    socket.on(
+      "call:leave",
+      (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const { callId } = callIdSchema.parse(payload);
+          const call = calls.get(callId);
+          const { ended } = calls.leave(callId, userId);
+          if (callSocketBindings.get(userId)?.callId === callId) {
+            callSocketBindings.delete(userId);
+          }
+          if (ended) clearCallSocketBindings(call);
+          emitToCallUsers(
+            io,
+            call.participants.map((participant) => participant.id),
+            "call:participant-left",
+            { callId, userId },
+          );
+          if (ended) {
+            emitToCallUsers(
+              io,
+              [
+                ...call.participants.map((participant) => participant.id),
+                ...call.pendingUserIds,
+              ],
+              "call:ended",
+              {
+                callId,
+                reason: "empty",
+              },
+            );
+          }
+          acknowledge?.({ ok: true, call });
+        } catch (error) {
+          acknowledgeCallError(error, acknowledge, userId, "leave call");
+        }
+      },
+    );
+
+    socket.on(
+      "call:signal",
+      (payload: unknown, acknowledge?: SocketAck) => {
+        try {
+          const signal = callSignalSchema.parse(payload);
+          if (Buffer.byteLength(JSON.stringify(signal.data), "utf8") > CALL_SIGNAL_MAX_BYTES) {
+            acknowledge?.({
+              ok: false,
+              error: { code: "PAYLOAD_TOO_LARGE", message: "Call signal is too large." },
+            });
+            return;
+          }
+          const call = calls.validateSignal(
+            signal.callId,
+            userId,
+            signal.toUserId,
+          );
+          const data = {
+            callId: signal.callId,
+            fromUserId: userId,
+            signalType: signal.signalType as CallSignalType,
+            data: signal.data,
+          };
+          io.to(`user:${signal.toUserId}`).emit("call:signal", data);
+          acknowledge?.({ ok: true, call });
+        } catch (error) {
+          acknowledgeCallError(error, acknowledge, userId, "relay call signal");
+        }
+      },
+    );
+
     if (userSet.size === 1) {
       io.emit("user:online", { userId });
     }
@@ -301,12 +660,73 @@ export function createSocketServer(httpServer: HttpServer) {
       );
       const activeSockets = userSockets.get(userId);
       activeSockets?.delete(socket.id);
-      if (!activeSockets || activeSockets.size === 0) {
+      const lastSocketDisconnected = !activeSockets || activeSockets.size === 0;
+      const callBinding = callSocketBindings.get(userId);
+      const callSocketDisconnected = callBinding?.socketId === socket.id;
+      if (lastSocketDisconnected) {
         userSockets.delete(userId);
+      }
+      if (lastSocketDisconnected || callSocketDisconnected) {
+        const callId = calls.activeCallForUser(userId);
+        const callBeforeDisconnect = callId ? calls.get(callId) : null;
+        if (callSocketDisconnected) callSocketBindings.delete(userId);
+        for (const disconnectedCall of calls.removeDisconnectedUser(userId)) {
+          emitToCallUsers(
+            io,
+            disconnectedCall.call.participants.map((participant) => participant.id),
+            "call:participant-left",
+            { callId: disconnectedCall.call.id, userId },
+          );
+          if (disconnectedCall.ended) {
+            if (callBeforeDisconnect) {
+              clearCallSocketBindings(callBeforeDisconnect);
+            }
+            emitToCallUsers(
+              io,
+              disconnectedCall.notifyUserIds,
+              "call:ended",
+              { callId: disconnectedCall.call.id, reason: "participant-disconnected" },
+            );
+          }
+        }
+      }
+      if (lastSocketDisconnected) {
         io.emit("user:offline", { userId });
       }
     });
   });
 
   return io;
+}
+
+function acknowledgeCallError(
+  error: unknown,
+  acknowledge: SocketAck | undefined,
+  userId: string,
+  operation: string,
+) {
+  if (error instanceof CallRegistryError || error instanceof z.ZodError) {
+    acknowledge?.({
+      ok: false,
+      error: {
+        code:
+          error instanceof CallRegistryError
+            ? error.code
+            : "INVALID_PAYLOAD",
+        message:
+          error instanceof CallRegistryError
+            ? error.message
+            : "Invalid call request.",
+      },
+    });
+    return;
+  }
+  logger.error(
+    { errorName: error instanceof Error ? error.name : "UnknownError", userId, operation },
+    "Call signaling operation failed",
+  );
+  acknowledge?.({
+    ok: false,
+    error: { code: "INTERNAL_ERROR", message: "Unable to complete call action." },
+  });
 }

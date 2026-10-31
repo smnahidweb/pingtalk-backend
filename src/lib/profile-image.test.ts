@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, createHmac } from "node:crypto";
 import { test } from "node:test";
 import { HttpError } from "./errors.js";
 import {
@@ -7,6 +8,7 @@ import {
   MESSAGE_ATTACHMENT_MAX_BYTES,
   PROFILE_IMAGE_MAX_BYTES,
   sanitizeAttachmentFileName,
+  signCloudinaryParameters,
   validateMessageAttachment,
   validateProfileImage,
 } from "./profile-image.js";
@@ -54,12 +56,48 @@ test("Cloudinary profile asset IDs are stable and do not expose account IDs", ()
   assert.match(first, /^pingtalk\/profiles\/[a-f0-9]{64}$/);
 });
 
+test("Cloudinary signatures use SHA-1 over sorted parameters and the API secret", () => {
+  const parameters = {
+    timestamp: "1700000000",
+    public_id: "asset123",
+    folder: "pingtalk",
+    type: "authenticated",
+    overwrite: "true",
+  };
+  const apiSecret = "test-secret";
+  const canonical = Object.entries(parameters)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("&");
+  const signature = signCloudinaryParameters(parameters, apiSecret);
+
+  assert.equal(
+    signature,
+    createHash("sha1").update(`${canonical}${apiSecret}`).digest("hex"),
+  );
+  assert.notEqual(
+    signature,
+    createHmac("sha1", apiSecret).update(canonical).digest("hex"),
+  );
+});
+
 test("private attachment URLs must be authenticated assets from the configured Cloudinary account", () => {
   const valid =
-    "https://res.cloudinary.com/pingtalk/image/authenticated/s--signed--/pingtalk/file";
-  assert.equal(
-    getAuthenticatedCloudinaryAssetUrl(valid, "pingtalk", "image"),
+    "https://res.cloudinary.com/pingtalk/image/authenticated/pingtalk/file.jpg";
+  const signed = getAuthenticatedCloudinaryAssetUrl(
     valid,
+    "pingtalk",
+    "image",
+    "test-secret",
+  );
+  assert.equal(
+    signed,
+    getAuthenticatedCloudinaryAssetUrl(
+      "https://res.cloudinary.com/pingtalk/image/authenticated/s--AAAAAAAA--/pingtalk/file.jpg",
+      "pingtalk",
+      "image",
+      "test-secret",
+    ),
   );
   for (const invalid of [
     "https://example.invalid/pingtalk/image/authenticated/file",
@@ -69,11 +107,23 @@ test("private attachment URLs must be authenticated assets from the configured C
     "http://res.cloudinary.com/pingtalk/image/authenticated/file",
   ]) {
     assert.throws(
-      () => getAuthenticatedCloudinaryAssetUrl(invalid, "pingtalk", "image"),
+      () => getAuthenticatedCloudinaryAssetUrl(invalid, "pingtalk", "image", "test-secret"),
       (error: unknown) =>
         error instanceof HttpError && error.code === "FILE_STORAGE_FAILED",
     );
   }
+});
+
+test("authenticated Cloudinary delivery signature matches the documented SHA-1 vector", () => {
+  assert.equal(
+    getAuthenticatedCloudinaryAssetUrl(
+      "https://res.cloudinary.com/demo/image/authenticated/c_fill,w_300,h_250/e_grayscale/sample-authenticated.png",
+      "demo",
+      "image",
+      "abcd",
+    ),
+    "https://res.cloudinary.com/demo/image/authenticated/s--iDy_JeBq--/c_fill,w_300,h_250/e_grayscale/sample-authenticated.png",
+  );
 });
 
 test("message attachment validation accepts supported image signatures and PDFs", () => {

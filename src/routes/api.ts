@@ -1,6 +1,7 @@
 import { ConversationRole, ConversationType } from "../generated/prisma/client.js";
 import express, { Router } from "express";
 import { prisma } from "../lib/prisma.js";
+import { env } from "../config/env.js";
 import {
   emitMessageCreated,
   emitMessageReactionsUpdated,

@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import { env } from "../config/env.js";
 import { HttpError } from "./errors.js";
 import { logger } from "./logger.js";
@@ -105,7 +105,7 @@ function getCloudinaryConfig() {
   };
 }
 
-function signCloudinaryParameters(
+export function signCloudinaryParameters(
   parameters: Record<string, string>,
   apiSecret: string,
 ) {
@@ -113,7 +113,7 @@ function signCloudinaryParameters(
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([key, value]) => `${key}=${value}`)
     .join("&");
-  return createHmac("sha1", apiSecret).update(canonical).digest("hex");
+  return createHash("sha1").update(`${canonical}${apiSecret}`).digest("hex");
 }
 
 async function uploadCloudinaryBuffer({
@@ -269,6 +269,7 @@ export function getAuthenticatedCloudinaryAssetUrl(
   assetUrl: string,
   cloudName: string,
   resourceType: "image" | "raw",
+  apiSecret: string,
 ) {
   let url: URL;
   try {
@@ -288,6 +289,16 @@ export function getAuthenticatedCloudinaryAssetUrl(
   ) {
     throw new HttpError(502, "FILE_STORAGE_FAILED", "Stored file metadata is invalid.");
   }
+  const assetPath = url.pathname.slice(expectedPathPrefix.length)
+    .replace(/^s--[A-Za-z0-9_-]{8}--\//, "");
+  if (!assetPath) {
+    throw new HttpError(502, "FILE_STORAGE_FAILED", "Stored file metadata is invalid.");
+  }
+  const signature = createHash("sha1")
+    .update(`${assetPath}${apiSecret}`)
+    .digest("base64url")
+    .slice(0, 8);
+  url.pathname = `${expectedPathPrefix}s--${signature}--/${assetPath}`;
   return url.toString();
 }
 
@@ -296,11 +307,12 @@ export async function fetchPrivateMessageAttachment(
   resourceType: "image" | "raw",
   expectedSize: number,
 ) {
-  const { cloudName } = getCloudinaryConfig();
+  const { cloudName, apiSecret } = getCloudinaryConfig();
   const safeUrl = getAuthenticatedCloudinaryAssetUrl(
     assetUrl,
     cloudName,
     resourceType,
+    apiSecret,
   );
   let response: Response;
   try {

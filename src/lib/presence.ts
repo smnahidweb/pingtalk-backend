@@ -5,6 +5,7 @@ export type PresenceDisconnect = {
 
 export class UserSocketRegistry {
   private readonly socketsByUserId = new Map<string, Set<string>>();
+  private readonly lastSeenByUserId = new Map<string, Date>();
 
   connect(userId: string, socketId: string) {
     let sockets = this.socketsByUserId.get(userId);
@@ -24,6 +25,7 @@ export class UserSocketRegistry {
     }
     if (sockets.size > 0) return { found: true, lastSocket: false };
     this.socketsByUserId.delete(userId);
+    this.lastSeenByUserId.set(userId, new Date());
     return { found: true, lastSocket: true };
   }
 
@@ -37,5 +39,13 @@ export class UserSocketRegistry {
 
   activeUserIds() {
     return [...this.socketsByUserId.keys()];
+  }
+
+  getLastSeen(userId: string): Date | null {
+    return this.lastSeenByUserId.get(userId) ?? null;
+  }
+
+  setLastSeen(userId: string, date: Date = new Date()) {
+    this.lastSeenByUserId.set(userId, date);
   }
 }

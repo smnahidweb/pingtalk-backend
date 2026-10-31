@@ -14,7 +14,107 @@ export class HttpError extends Error {
   }
 }
 
-export const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => {
+const safeDatabaseErrorCode = /^P\d{4}$/;
+const safeExternalDatabaseErrorCodes = new Set([
+  "08001",
+  "08003",
+  "08006",
+  "08P01",
+  "23502",
+  "23503",
+  "23505",
+  "23514",
+  "28P01",
+  "3D000",
+  "40001",
+  "40P01",
+  "42P01",
+  "42703",
+  "57P01",
+  "57P03",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+]);
+const safeExceptionClasses = new Set([
+  "AggregateError",
+  "APIError",
+  "BetterAuthError",
+  "DatabaseError",
+  "Error",
+  "HttpError",
+  "PrismaClientEngineVersionNotSupportedError",
+  "PrismaClientInitializationError",
+  "PrismaClientKnownRequestError",
+  "PrismaClientRustPanicError",
+  "PrismaClientUnknownRequestError",
+  "PrismaClientValidationError",
+  "PostgresError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+  "ZodError",
+]);
+
+function getSafeDatabaseErrorCode(error: unknown): string | undefined {
+  const seen = new Set<object>();
+  let current = error;
+
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current !== "object" || current === null || seen.has(current)) {
+      return undefined;
+    }
+    seen.add(current);
+
+    if (
+      "code" in current &&
+      typeof current.code === "string" &&
+      (safeDatabaseErrorCode.test(current.code) ||
+        safeExternalDatabaseErrorCodes.has(current.code))
+    ) {
+      return current.code;
+    }
+    current = "cause" in current ? current.cause : undefined;
+  }
+
+  return undefined;
+}
+
+function getSafeStackFrames(error: unknown): string[] | undefined {
+  if (!(error instanceof Error) || typeof error.stack !== "string") return undefined;
+
+  const frames = error.stack
+    .split("\n")
+    .slice(1)
+    .filter((frame) => /^\s*at\s/.test(frame))
+    .slice(0, 24)
+    .flatMap((frame) => {
+      const location = frame.trim().replace(/^at\s+/, "");
+      const openParenthesis = location.lastIndexOf("(");
+      const fileLocation = openParenthesis >= 0
+        ? location.slice(openParenthesis + 1).replace(/\)$/, "")
+        : location.replace(/^async\s+/, "");
+      const match = fileLocation.match(/(?:^|[\\/])([^\\/]+):(\d+):(\d+)$/);
+      return match ? [`${match[1]}:${match[2]}:${match[3]}`] : [];
+    });
+
+  return frames.length > 0 ? frames : undefined;
+}
+
+export function getSafeAuthExceptionDetails(error: unknown) {
+  const exceptionClass = error instanceof Error ? error.name : "NonErrorThrown";
+  return {
+    exceptionClass: safeExceptionClasses.has(exceptionClass) ? exceptionClass : "Error",
+    databaseCode: getSafeDatabaseErrorCode(error),
+    stackFrames: getSafeStackFrames(error),
+  };
+}
+
+export const errorHandler: ErrorRequestHandler = (error, request, response, _next) => {
   void _next;
   if (error instanceof HttpError) {
     response.status(error.status).json({
@@ -89,7 +189,25 @@ export const errorHandler: ErrorRequestHandler = (error, _request, response, _ne
 
   const errorName =
     error instanceof Error ? error.name : "UnknownError";
-  logger.error({ errorName }, "Unhandled request error");
+  if (request.method === "POST" && request.path === "/api/auth/sign-in/email") {
+    const requestIdValue = "id" in request ? request.id : undefined;
+    const requestId =
+      (typeof requestIdValue === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(requestIdValue)) ||
+      (typeof requestIdValue === "number" && Number.isSafeInteger(requestIdValue))
+        ? String(requestIdValue)
+        : "unavailable";
+    logger.error(
+      {
+        authDiagnostic: {
+          requestId,
+          ...getSafeAuthExceptionDetails(error),
+        },
+      },
+      "Unhandled authentication sign-in error",
+    );
+  } else {
+    logger.error({ errorName }, "Unhandled request error");
+  }
   response.status(500).json({
     error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." },
   });

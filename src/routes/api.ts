@@ -7,6 +7,7 @@ import {
   emitReadReceipt,
   emitUserProfileUpdated,
   getOnlineUserIds,
+  getUserLastSeen,
 } from "../lib/socket.js";
 import { HttpError, asyncRoute } from "../lib/errors.js";
 import {
@@ -66,6 +67,10 @@ function serializeAttachments<T extends { id: string }>(attachments: T[]) {
     id,
     url: `/api/attachments/${encodeURIComponent(id)}/content`,
   }));
+}
+
+function resolveLastSeenAt(userId: string, storedLastSeenAt: Date | null) {
+  return getUserLastSeen(userId) ?? storedLastSeenAt;
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -159,7 +164,12 @@ apiRouter.get(
       },
     });
     if (!user) throw new HttpError(401, "UNAUTHENTICATED", "Your session is no longer valid.");
-    response.json({ user });
+    response.json({
+      user: {
+        ...user,
+        lastSeenAt: resolveLastSeenAt(userId, user.lastSeenAt),
+      },
+    });
   }),
 );
 
@@ -291,7 +301,9 @@ apiRouter.get(
     response.json({
       user: {
         ...user,
-        lastSeenAt: sharedConversation ? user.lastSeenAt : null,
+        lastSeenAt: sharedConversation
+          ? resolveLastSeenAt(user.id, user.lastSeenAt)
+          : null,
         online:
           Boolean(sharedConversation) &&
           getOnlineUserIds([user.id]).has(user.id),
@@ -442,7 +454,10 @@ apiRouter.get(
                 ? "You"
                 : membership.user.name,
             image: membership.user.image,
-            lastSeenAt: membership.user.lastSeenAt,
+            lastSeenAt: resolveLastSeenAt(
+              membership.userId,
+              membership.user.lastSeenAt,
+            ),
             online: getOnlineUserIds([membership.userId]).has(membership.userId),
             role: membership.role,
           })),
@@ -495,6 +510,10 @@ apiRouter.get(
         memberCount: conversation._count.memberships,
           members: conversation.memberships.map((membership) => ({
           ...membership.user,
+            lastSeenAt: resolveLastSeenAt(
+              membership.userId,
+              membership.user.lastSeenAt,
+            ),
             online: getOnlineUserIds([membership.userId]).has(membership.userId),
             role: membership.role,
             joinedAt: membership.joinedAt,
@@ -540,6 +559,7 @@ apiRouter.get(
     response.json({
       participants: page.map(({ user, role, joinedAt }) => ({
         ...user,
+        lastSeenAt: resolveLastSeenAt(user.id, user.lastSeenAt),
         online: getOnlineUserIds([user.id]).has(user.id),
         role,
         joinedAt,

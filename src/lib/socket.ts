@@ -85,6 +85,10 @@ export function getOnlineUserIds(userIds: Iterable<string>) {
   return onlineUsers?.onlineUserIds(userIds) ?? new Set<string>();
 }
 
+export function getUserLastSeen(userId: string): Date | null {
+  return onlineUsers?.getLastSeen(userId) ?? null;
+}
+
 export function emitMessageCreated(conversationId: string, message: SerializedMessage) {
   socketServer?.to(`conversation:${conversationId}`).emit("message:new", {
     conversationId,
@@ -181,38 +185,15 @@ export function createSocketServer(httpServer: HttpServer) {
   const presenceHeartbeatTimer = setInterval(() => {
     const userIds = userSockets.activeUserIds();
     if (userIds.length === 0) return;
-    void prisma.user
-      .updateMany({
-        where: { id: { in: userIds } },
-        data: { lastSeenAt: new Date() },
-      })
-      .catch((error: unknown) => {
-        logger.error(
-          {
-            errorName: error instanceof Error ? error.name : "UnknownError",
-            activeUserCount: userIds.length,
-          },
-          "Unable to refresh authenticated user presence timestamps",
-        );
-      });
+    const now = new Date();
+    for (const userId of userIds) {
+      userSockets.setLastSeen(userId, now);
+    }
   }, 60_000);
   presenceHeartbeatTimer.unref();
 
   const persistLastSeen = async (userId: string, lastSeenAt: Date) => {
-    try {
-      await prisma.user.updateMany({
-        where: { id: userId },
-        data: { lastSeenAt },
-      });
-    } catch (error) {
-      logger.error(
-        {
-          errorName: error instanceof Error ? error.name : "UnknownError",
-          userId,
-        },
-        "Unable to persist user last-seen timestamp",
-      );
-    }
+    userSockets.setLastSeen(userId, lastSeenAt);
   };
 
   const emitPresenceToConversationMembers = async (

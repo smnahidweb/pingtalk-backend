@@ -32,3 +32,11 @@ test("presence ignores stale disconnects and returns only active requested users
     new Set(["online"]),
   );
 });
+
+test("presence tracks and returns last-seen timestamp on final disconnect", () => {
+  const registry = new UserSocketRegistry();
+  assert.equal(registry.getLastSeen("user-1"), null);
+  registry.connect("user-1", "tab-1");
+  registry.disconnect("user-1", "tab-1");
+  assert.ok(registry.getLastSeen("user-1") instanceof Date);
+});

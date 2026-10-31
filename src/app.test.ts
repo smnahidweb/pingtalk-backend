@@ -4,6 +4,7 @@ import request from "supertest";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { getAuthCookieAttributes } from "./lib/auth.js";
+import { getSafeAuthExceptionDetails } from "./lib/errors.js";
 
 const app = createApp({ mountAuth: false });
 
@@ -28,6 +29,57 @@ test("auth cookies are secure in production and lax in all environments", () => 
     sameSite: "lax",
     secure: false,
   });
+});
+
+test("authentication diagnostics omit messages, causes, and metadata", () => {
+  const error = Object.assign(
+    new Error("email=person@example.invalid password=diagnostic-secret"),
+    {
+      name: "PrismaClientKnownRequestError",
+      code: "P1001",
+      meta: { email: "person@example.invalid" },
+      cause: new Error("token=diagnostic-token"),
+    },
+  );
+  const details = getSafeAuthExceptionDetails(error);
+  const serialized = JSON.stringify(details);
+
+  assert.equal(details.exceptionClass, "PrismaClientKnownRequestError");
+  assert.equal(details.databaseCode, "P1001");
+  assert.ok(details.stackFrames?.length);
+  assert.equal("message" in details, false);
+  assert.equal("cause" in details, false);
+  assert.equal("meta" in details, false);
+  assert.doesNotMatch(serialized, /person@example\.invalid|diagnostic-secret|diagnostic-token/);
+});
+
+test("authentication diagnostics reject unsafe error codes", () => {
+  for (const code of ["user@example.invalid", "TOKEN"]) {
+    const error = Object.assign(new Error("do not log"), { code });
+    assert.equal(getSafeAuthExceptionDetails(error).databaseCode, undefined);
+  }
+});
+
+test("authentication diagnostics normalize unknown exception names", () => {
+  const error = Object.assign(new Error("do not log"), {
+    name: "diagnostic-secret",
+  });
+  assert.equal(getSafeAuthExceptionDetails(error).exceptionClass, "Error");
+});
+
+test("unexpected sign-in exceptions return only the generic error response", async () => {
+  const authApp = createApp({
+    authHandler: (_request, _response, next) => {
+      next(new Error("diagnostic-only exception message"));
+    },
+  });
+  const response = await request(authApp).post("/api/auth/sign-in/email");
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(response.body, {
+    error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." },
+  });
+  assert.equal(JSON.stringify(response.body).includes("diagnostic-only"), false);
 });
 
 test("CORS accepts the configured frontend origin and credentials", async () => {
